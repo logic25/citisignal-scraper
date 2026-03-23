@@ -87,7 +87,7 @@ def scrape_bis():
         if action == "profile":
             result = scrape_profile(page, bin_number, boro, block, lot, debug)
         elif action == "jobs":
-            result = scrape_jobs_by_location(page, bin_number, debug)
+            result = scrape_jobs_by_location(page, bin_number, debug, boro, block, lot)
         elif action == "job_detail":
             result = scrape_job_detail(page, job_number, debug)
         else:
@@ -222,46 +222,56 @@ def scrape_profile(page, bin_number, boro, block, lot, debug=False):
     return result
 
 
-def scrape_jobs_by_location(page, bin_number, debug=False):
+def scrape_jobs_by_location(page, bin_number, debug=False, boro=None, block=None, lot=None):
     """Scrape BIS Jobs/Filings page for a BIN, including PAAs."""
     try:
-        navigate_bis_search(page, bin_number)
+        # Step 1: Get to property profile first (this works reliably)
+        navigate_bis_search(page, bin_number, boro, block, lot)
+        log(f"Jobs: On property profile, URL: {page.url}")
 
-        # From property profile, click the jobs link that shows ALL filings
-        # Use the link that includes allinquirytype=BXS1PRA3 for full list
+        # Step 2: Click the first "Jobs/Filings" link from the property profile
+        # There are multiple links — we want the general one, not filtered
         try:
-            page.click('a[href*="JobsQueryByLocationServlet"]', timeout=5000)
-            time.sleep(2)
-        except Exception:
-            # Fallback: navigate directly
+            # Look for any jobs link
+            links = page.query_selector_all('a[href*="JobsQueryByLocationServlet"]')
+            if links:
+                # Click the first one that isn't filtered
+                links[0].click()
+                time.sleep(2)
+                log(f"Jobs: Clicked jobs link, URL: {page.url}")
+            else:
+                raise Exception("No jobs link found on profile page")
+        except Exception as click_err:
+            log(f"Jobs: Click failed ({click_err}), trying direct URL")
+            # Fallback with session cookies already set
             jobs_url = (f"https://a810-bisweb.nyc.gov/bisweb/JobsQueryByLocationServlet"
-                        f"?allbin={bin_number}&allinquirytype=BXS1PRA3&requestid=0")
+                        f"?requestid=0&allbin={bin_number}")
             page.goto(jobs_url, timeout=15000, wait_until="domcontentloaded")
             time.sleep(2)
 
-        # IMPORTANT: Change dropdown to show PAAs/subsequents
-        # Default is "Hide Subsequent Filings / PAAs" — we need to show them
+        # Step 3: Change dropdown to "Show All Filings" to include PAAs
         try:
-            # The dropdown name is typically "fillerdata" or similar
             selects = page.query_selector_all('select')
             for sel in selects:
                 options = sel.query_selector_all('option')
                 for opt in options:
-                    text = opt.text_content() or ""
-                    if "show" in text.lower() and ("subsequent" in text.lower() or "paa" in text.lower()):
-                        sel.select_option(label=text.strip())
-                        log(f"Selected dropdown option: {text.strip()}")
+                    text = (opt.text_content() or "").strip()
+                    if "show" in text.lower() and ("filing" in text.lower() or "subsequent" in text.lower() or "paa" in text.lower()):
+                        sel.select_option(label=text)
+                        log(f"Jobs: Selected '{text}'")
                         break
 
-            # Click APPLY button
-            page.click('input[type="submit"][value="APPLY"]', timeout=3000)
-            time.sleep(2)
-            log("Clicked APPLY to show PAAs")
+            # Click APPLY
+            apply_btn = page.query_selector('input[type="submit"][value="APPLY"]')
+            if apply_btn:
+                apply_btn.click()
+                time.sleep(2)
+                log("Jobs: Clicked APPLY to show all filings")
         except Exception as paa_err:
-            log(f"PAA dropdown not found or failed: {paa_err} — continuing with default view")
+            log(f"Jobs: PAA dropdown failed: {paa_err} — continuing with default view")
 
     except Exception as e:
-        log(f"Jobs navigation error: {e}")
+        log(f"Jobs: Navigation error: {e}")
         return {"error": str(e), "jobs": []}
 
     html = page.content()
