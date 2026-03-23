@@ -343,6 +343,20 @@ def scrape_job_detail(page, job_number, bin_number=None, debug=False):
     }
 
 
+JOB_TYPE_MAP = {
+    "A1": "Alteration Type 1",
+    "A2": "Alteration Type 2",
+    "A3": "Alteration Type 3",
+    "NB": "New Building",
+    "DM": "Demolition",
+    "SI": "Sign",
+    "FO": "Foundation",
+    "SH": "Scaffold",
+    "FN": "Fence",
+    "EQ": "Equipment",
+}
+
+
 def parse_bis_jobs_table(html: str) -> list:
     """Parse BIS job/filing table HTML into structured data.
 
@@ -364,71 +378,67 @@ def parse_bis_jobs_table(html: str) -> list:
         date_match = re.search(r'(\d{2}/\d{2}/\d{4})', row)
 
         if job_match and date_match:
-            # Extract all cell contents, stripping HTML tags
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
-            cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+            # Extract ALL cell contents including empty ones (positional)
+            raw_cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+            cells = [re.sub(r'<[^>]+>', '', c).replace('&nbsp;', ' ').strip() for c in raw_cells]
 
-            # Filter out empty cells from spacer images
-            cells = [c for c in cells if c and not c.startswith('\n')]
-
-            # BIS columns: FILE DATE, JOB#, DOC#, JOB TYPE, JOB STATUS, STATUS DATE, LIC#, [LIC TYPE], APPLICANT, IN AUDIT, ZONING
             job_num = job_match.group(1)
-            filing_date = date_match.group(1)
 
-            # Find doc number — typically 2 digits after the job number
-            doc_num = "01"
-            for c in cells:
-                if re.match(r'^\d{1,2}$', c) and c != job_num[:2]:
-                    doc_num = c.zfill(2)
-                    break
+            # BIS columns are positional (0-indexed):
+            # 0: FILE DATE, 1: JOB # (link), 2: DOC #, 3: JOB TYPE,
+            # 4: JOB STATUS, 5: STATUS DATE, 6: LIC #, 7: LIC TYPE (PE/RA),
+            # 8: APPLICANT, 9: IN AUDIT, 10: ZONING APPROVAL
+            #
+            # But some cells may be empty or merged. Use safe indexing.
+            def cell(idx):
+                return cells[idx].strip() if idx < len(cells) and cells[idx].strip() else None
 
-            # Find job type (A1, A2, A3, NB, DM, etc.)
-            job_type = None
-            for c in cells:
-                if re.match(r'^[A-Z][A-Z0-9]?[0-9]?$', c) and len(c) <= 3:
-                    job_type = c
-                    break
+            filing_date = cell(0) or date_match.group(1)
+            doc_num = (cell(2) or "01").zfill(2)
+            job_type = cell(3)
+            job_status = cell(4)
+            status_date = cell(5)
 
-            # Find job status — contains multi-word status like "X SIGNED OFF"
-            job_status = None
-            job_status_code = None
-            for c in cells:
-                if any(s in c.upper() for s in ['SIGNED OFF', 'APPROVED', 'IN PROCESS', 'PERMIT ISSUED', 'WITHDRAWN']):
-                    job_status = c
-                    parts = c.split()
-                    if parts:
-                        job_status_code = parts[0]
-                    break
-
-            # Find status date (second date in the row)
-            dates = re.findall(r'(\d{2}/\d{2}/\d{4})', row)
-            status_date = dates[1] if len(dates) > 1 else None
-
-            # Find license number and type
-            lic_match = re.search(r'(\d{7})\s*(PE|RA)', ' '.join(cells))
-            license_number = lic_match.group(1) if lic_match else None
+            # License: could be in cell 6, sometimes "0034627 RA" spans cells 6+7
+            lic_raw = (cell(6) or "") + " " + (cell(7) or "")
+            lic_match = re.search(r'(\d{6,7})\s*(PE|RA)', lic_raw)
+            license_number = lic_match.group(1) if lic_match else cell(6)
             license_type = lic_match.group(2) if lic_match else None
 
-            # Find applicant — last significant text cell
+            # Applicant name — cell 8 if lic has type, otherwise could shift
             applicant = None
-            for c in reversed(cells):
-                if (c and len(c) > 2 and not re.match(r'^\d', c) and
-                    c.upper() not in ['NOT APPLICABLE', 'GRANTED', 'Y', 'N', '']):
-                    applicant = c
-                    break
+            if lic_match:
+                # License took cells 6+7, applicant is cell 8
+                applicant = cell(8)
+            else:
+                # License might be just cell 6, type in 7, applicant in 8
+                # Or license+type in 6, applicant in 7
+                candidate = cell(8) or cell(7)
+                # Make sure it's a name, not a date or status code
+                if candidate and not re.match(r'^\d{2}/\d{2}', candidate) and candidate.upper() not in ['Y', 'N', '']:
+                    applicant = candidate
 
-            # Zoning approval
+            # Zoning approval — last cell or second to last
             zoning = None
-            for c in cells:
-                if 'GRANTED' in c.upper() or 'NOT APPLICABLE' in c.upper():
+            for idx in range(len(cells) - 1, max(8, len(cells) - 3), -1):
+                c = cell(idx)
+                if c and ('GRANTED' in c.upper() or 'NOT APPLICABLE' in c.upper()):
                     zoning = c
                     break
+
+            # Extract status code
+            job_status_code = None
+            if job_status:
+                parts = job_status.split()
+                if parts:
+                    job_status_code = parts[0]
 
             current_job = {
                 "filing_date": filing_date,
                 "job_number": job_num,
                 "doc_number": doc_num,
-                "job_type": job_type,
+                "job_type": JOB_TYPE_MAP.get(job_type, job_type) if job_type else None,
+                "job_type_code": job_type,
                 "job_status": job_status,
                 "job_status_code": job_status_code,
                 "status_date": status_date,
