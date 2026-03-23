@@ -251,25 +251,27 @@ def scrape_jobs_by_location(page, bin_number, debug=False):
 
 
 def scrape_job_detail(page, job_number, debug=False):
-    """Scrape BIS job detail page for all doc numbers."""
-    # Navigate to BIS first, then use job search
+    """Scrape BIS job detail page for all doc numbers.
+
+    BIS doesn't have a direct job search from the main page.
+    We use the JobsQueryByNumberServlet URL but navigate through
+    the search form first to establish a session cookie.
+    """
+    # First visit search page to get session cookies
     search_url = "https://a810-bisweb.nyc.gov/bisweb/bsqpm01.jsp"
+    log(f"Job detail: visiting search page for session...")
     page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
     time.sleep(1)
 
-    # Fill job number field
+    # Now navigate to the job query URL with the session established
+    job_url = (f"https://a810-bisweb.nyc.gov/bisweb/JobsQueryByNumberServlet"
+               f"?passjobnumber={job_number}&passjoession=0&requestid=0")
+    log(f"Job detail: navigating to {job_url}")
     try:
-        page.fill('input[name="allnumbhous"]', "")  # clear other fields
-        # BIS search page may have a job number search option
-        # Navigate to job search page instead
-        page.goto("https://a810-bisweb.nyc.gov/bisweb/bsqpm02.jsp",
-                   timeout=15000, wait_until="domcontentloaded")
-        time.sleep(1)
-        page.fill('input[name="passjobnumber"]', str(job_number))
-        page.click('input[type="submit"][value="GO"]')
+        page.goto(job_url, timeout=15000, wait_until="domcontentloaded")
         time.sleep(2)
     except Exception as e:
-        log(f"Job search error: {e}")
+        log(f"Job detail navigation error: {e}")
         return {"error": str(e), "documents": []}
 
     html = page.content()
