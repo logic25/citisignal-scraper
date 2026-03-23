@@ -114,20 +114,24 @@ def navigate_bis_search(page, bin_number=None, boro=None, block=None, lot=None):
         # BIS has two BIN fields: "bin" (Property Profile section) and "allbin" (another section)
         # Try "bin" first (with go4 submit), fallback to "allbin" (with go8 submit)
         try:
-            page.fill('input[name="bin"]', str(bin_number), timeout=3000)
-            page.click('input[name="go4"]', timeout=3000)
+            page.fill('input[name="bin"]', str(bin_number), timeout=10000)
+            page.click('input[name="go4"]', timeout=5000)
             time.sleep(2)
             log(f"Searched via bin field, URL: {page.url}")
-            return  # Successfully navigated
-        except Exception:
-            log("bin field failed, trying allbin...")
-            page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
-            time.sleep(1)
-            page.fill('input[name="allbin"]', str(bin_number), timeout=3000)
-            page.click('input[name="go8"]', timeout=3000)
-            time.sleep(2)
-            log(f"Searched via allbin field, URL: {page.url}")
             return
+        except Exception as e1:
+            log(f"bin field failed ({e1}), trying allbin...")
+            try:
+                page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
+                time.sleep(1)
+                page.fill('input[name="allbin"]', str(bin_number), timeout=10000)
+                page.click('input[name="go8"]', timeout=5000)
+                time.sleep(2)
+                log(f"Searched via allbin field, URL: {page.url}")
+                return
+            except Exception as e2:
+                log(f"allbin also failed ({e2})")
+                raise ValueError(f"Could not search by BIN: {e1} / {e2}")
     elif block and lot:
         boro_val = boro or "1"
         log(f"Searching by boro={boro_val} block={block} lot={lot}")
@@ -240,7 +244,7 @@ def scrape_profile(page, bin_number, boro, block, lot, debug=False):
 def scrape_jobs_by_location(page, bin_number, debug=False, boro=None, block=None, lot=None):
     """Scrape BIS Jobs/Filings page for a BIN, including PAAs."""
     try:
-        # Step 1: Get to property profile first (this works reliably)
+        # Step 1: Navigate to BIS search and get to property profile
         navigate_bis_search(page, bin_number, boro, block, lot)
         log(f"Jobs: On property profile, URL: {page.url}")
 
