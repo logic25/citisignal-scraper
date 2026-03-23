@@ -103,46 +103,33 @@ def scrape_bis():
 
 
 def navigate_bis_search(page, bin_number=None, boro=None, block=None, lot=None):
-    """Navigate to BIS via the search form (required to get past Akamai)."""
-    search_url = "https://a810-bisweb.nyc.gov/bisweb/bsqpm01.jsp"
-    log(f"Navigating to BIS search page...")
-    page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
+    """Navigate to BIS by visiting homepage first (for cookies), then direct URL.
+
+    BIS search form fields are unreliable from Playwright. Instead:
+    1. Visit BIS homepage to get session cookies
+    2. Navigate directly to the target page URL
+    """
+    # Step 1: Visit BIS homepage to establish session/cookies
+    log("Visiting BIS homepage for session cookies...")
+    page.goto("https://a810-bisweb.nyc.gov/bisweb/bispi00.jsp",
+              timeout=15000, wait_until="domcontentloaded")
     time.sleep(1)
 
+    # Step 2: Navigate directly to Property Profile
     if bin_number:
-        log(f"Searching by BIN {bin_number}")
-        # BIS has two BIN fields: "bin" (Property Profile section) and "allbin" (another section)
-        # Try "bin" first (with go4 submit), fallback to "allbin" (with go8 submit)
-        try:
-            page.fill('input[name="bin"]', str(bin_number), timeout=10000)
-            page.click('input[name="go4"]', timeout=5000)
-            time.sleep(2)
-            log(f"Searched via bin field, URL: {page.url}")
-            return
-        except Exception as e1:
-            log(f"bin field failed ({e1}), trying allbin...")
-            try:
-                page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
-                time.sleep(1)
-                page.fill('input[name="allbin"]', str(bin_number), timeout=10000)
-                page.click('input[name="go8"]', timeout=5000)
-                time.sleep(2)
-                log(f"Searched via allbin field, URL: {page.url}")
-                return
-            except Exception as e2:
-                log(f"allbin also failed ({e2})")
-                raise ValueError(f"Could not search by BIN: {e1} / {e2}")
+        url = (f"https://a810-bisweb.nyc.gov/bisweb/PropertyProfileOverviewServlet"
+               f"?allbin={bin_number}&requestid=0")
     elif block and lot:
         boro_val = boro or "1"
-        log(f"Searching by boro={boro_val} block={block} lot={lot}")
-        page.select_option('select[name="allborough"]', boro_val)
-        page.fill('input[name="allblock"]', str(block))
-        page.fill('input[name="alllot"]', str(lot))
-        page.click('input[name="go5"]', timeout=3000)
-        time.sleep(2)
-        log(f"Searched via block/lot, URL: {page.url}")
+        url = (f"https://a810-bisweb.nyc.gov/bisweb/PropertyProfileOverviewServlet"
+               f"?boro={boro_val}&block={block}&lot={lot}&requestid=0")
     else:
         raise ValueError("Need bin or block+lot to search BIS")
+
+    log(f"Navigating to: {url}")
+    page.goto(url, timeout=15000, wait_until="domcontentloaded")
+    time.sleep(2)
+    log(f"Arrived at: {page.url}")
 
 
 def scrape_profile(page, bin_number, boro, block, lot, debug=False):
@@ -244,50 +231,21 @@ def scrape_profile(page, bin_number, boro, block, lot, debug=False):
 def scrape_jobs_by_location(page, bin_number, debug=False, boro=None, block=None, lot=None):
     """Scrape BIS Jobs/Filings page for a BIN, including PAAs."""
     try:
-        # Step 1: Navigate to BIS search and get to property profile
-        navigate_bis_search(page, bin_number, boro, block, lot)
-        log(f"Jobs: On property profile, URL: {page.url}")
+        # Visit BIS homepage first for session cookies
+        log("Jobs: Visiting BIS homepage for cookies...")
+        page.goto("https://a810-bisweb.nyc.gov/bisweb/bispi00.jsp",
+                   timeout=15000, wait_until="domcontentloaded")
+        time.sleep(1)
 
-        # Step 2: Click the first "Jobs/Filings" link from the property profile
-        # There are multiple links — we want the general one, not filtered
-        try:
-            # Look for any jobs link
-            links = page.query_selector_all('a[href*="JobsQueryByLocationServlet"]')
-            if links:
-                # Click the first one that isn't filtered
-                links[0].click()
-                time.sleep(2)
-                log(f"Jobs: Clicked jobs link, URL: {page.url}")
-            else:
-                raise Exception("No jobs link found on profile page")
-        except Exception as click_err:
-            log(f"Jobs: Click failed ({click_err}), trying direct URL")
-            # Fallback with session cookies already set
-            jobs_url = (f"https://a810-bisweb.nyc.gov/bisweb/JobsQueryByLocationServlet"
-                        f"?requestid=0&allbin={bin_number}")
-            page.goto(jobs_url, timeout=15000, wait_until="domcontentloaded")
-            time.sleep(2)
+        # Go directly to Jobs page with Show All Filings (BXS1PRA3 includes PAAs)
+        jobs_url = (f"https://a810-bisweb.nyc.gov/bisweb/JobsQueryByLocationServlet"
+                    f"?allbin={bin_number}&allinquirytype=BXS1PRA3&requestid=0")
+        log(f"Jobs: Navigating to {jobs_url}")
+        page.goto(jobs_url, timeout=15000, wait_until="domcontentloaded")
+        time.sleep(2)
+        log(f"Jobs: Arrived at {page.url}")
 
-        # Step 3: Change dropdown to "Show All Filings" to include PAAs
-        try:
-            selects = page.query_selector_all('select')
-            for sel in selects:
-                options = sel.query_selector_all('option')
-                for opt in options:
-                    text = (opt.text_content() or "").strip()
-                    if "show" in text.lower() and ("filing" in text.lower() or "subsequent" in text.lower() or "paa" in text.lower()):
-                        sel.select_option(label=text)
-                        log(f"Jobs: Selected '{text}'")
-                        break
-
-            # Click APPLY
-            apply_btn = page.query_selector('input[type="submit"][value="APPLY"]')
-            if apply_btn:
-                apply_btn.click()
-                time.sleep(2)
-                log("Jobs: Clicked APPLY to show all filings")
-        except Exception as paa_err:
-            log(f"Jobs: PAA dropdown failed: {paa_err} — continuing with default view")
+        # PAAs are already included via allinquirytype=BXS1PRA3 in the URL
 
     except Exception as e:
         log(f"Jobs: Navigation error: {e}")
