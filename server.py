@@ -223,12 +223,43 @@ def scrape_profile(page, bin_number, boro, block, lot, debug=False):
 
 
 def scrape_jobs_by_location(page, bin_number, debug=False):
-    """Scrape BIS Jobs/Filings page for a BIN."""
+    """Scrape BIS Jobs/Filings page for a BIN, including PAAs."""
     try:
         navigate_bis_search(page, bin_number)
-        # Click "Jobs/Filings" link from the property profile
-        page.click('a[href*="JobsQueryByLocationServlet"]', timeout=5000)
-        time.sleep(2)
+
+        # From property profile, click the jobs link that shows ALL filings
+        # Use the link that includes allinquirytype=BXS1PRA3 for full list
+        try:
+            page.click('a[href*="JobsQueryByLocationServlet"]', timeout=5000)
+            time.sleep(2)
+        except Exception:
+            # Fallback: navigate directly
+            jobs_url = (f"https://a810-bisweb.nyc.gov/bisweb/JobsQueryByLocationServlet"
+                        f"?allbin={bin_number}&allinquirytype=BXS1PRA3&requestid=0")
+            page.goto(jobs_url, timeout=15000, wait_until="domcontentloaded")
+            time.sleep(2)
+
+        # IMPORTANT: Change dropdown to show PAAs/subsequents
+        # Default is "Hide Subsequent Filings / PAAs" — we need to show them
+        try:
+            # The dropdown name is typically "fillerdata" or similar
+            selects = page.query_selector_all('select')
+            for sel in selects:
+                options = sel.query_selector_all('option')
+                for opt in options:
+                    text = opt.text_content() or ""
+                    if "show" in text.lower() and ("subsequent" in text.lower() or "paa" in text.lower()):
+                        sel.select_option(label=text.strip())
+                        log(f"Selected dropdown option: {text.strip()}")
+                        break
+
+            # Click APPLY button
+            page.click('input[type="submit"][value="APPLY"]', timeout=3000)
+            time.sleep(2)
+            log("Clicked APPLY to show PAAs")
+        except Exception as paa_err:
+            log(f"PAA dropdown not found or failed: {paa_err} — continuing with default view")
+
     except Exception as e:
         log(f"Jobs navigation error: {e}")
         return {"error": str(e), "jobs": []}
@@ -283,56 +314,146 @@ def scrape_job_detail(page, job_number, debug=False):
         return {"html": html[:50000], "html_length": len(html)}
 
     jobs = parse_bis_jobs_table(html)
+
+    # Try to extract estimated cost and other details from the page
+    estimated_cost = None
+    m = re.search(r'(?:Estimated\s*(?:Job\s*)?Cost|Initial\s*Cost)[^$]*\$\s*([\d,]+)', html, re.IGNORECASE)
+    if m:
+        estimated_cost = m.group(1).replace(',', '')
+
+    # Check for withdrawn in page text
+    withdrawn = "WITHDRAWN" in html.upper()
+
     return {
         "job_number": job_number,
         "documents": jobs,
         "doc_count": len(jobs),
+        "estimated_cost": estimated_cost,
+        "withdrawn": withdrawn,
         "scraped_at": datetime.utcnow().isoformat(),
     }
 
 
 def parse_bis_jobs_table(html: str) -> list:
-    """Parse BIS job/filing table HTML into structured data."""
+    """Parse BIS job/filing table HTML into structured data.
+
+    BIS table columns:
+    FILE DATE | JOB # | DOC # | JOB TYPE | JOB STATUS | STATUS DATE | LIC # | APPLICANT | IN AUDIT | ZONING APPROVAL
+
+    Each job has a data row followed by a description row.
+    Description row contains the work description and floor info.
+    """
     jobs = []
+
+    # Split into rows
     rows = re.split(r'<tr[^>]*>', html, flags=re.IGNORECASE)
 
     current_job = None
-    for row in rows:
+    for i, row in enumerate(rows):
+        # Look for rows containing a job number link
+        job_match = re.search(r'passjobnumber=(\d+)', row)
         date_match = re.search(r'(\d{2}/\d{2}/\d{4})', row)
-        job_match = re.search(r'passjobnumber=(\d{9})', row)
 
-        if date_match and job_match:
+        if job_match and date_match:
+            # Extract all cell contents, stripping HTML tags
             cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
             cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
 
-            if len(cells) >= 8:
-                current_job = {
-                    "filing_date": cells[0] if cells[0] else None,
-                    "job_number": job_match.group(1),
-                    "doc_number": cells[2] if len(cells) > 2 else "01",
-                    "job_type": cells[3] if len(cells) > 3 else None,
-                    "job_status": cells[4] if len(cells) > 4 else None,
-                    "status_date": cells[5] if len(cells) > 5 else None,
-                    "license_number": cells[6] if len(cells) > 6 else None,
-                    "applicant": cells[7] if len(cells) > 7 else None,
-                    "in_audit": cells[8].strip().upper() == "Y" if len(cells) > 8 else False,
-                    "zoning_approval": cells[9] if len(cells) > 9 else None,
-                    "description": None,
-                    "withdrawn": False,
-                    "source": "BIS_SCRAPE",
-                }
-                if current_job["job_status"]:
-                    parts = current_job["job_status"].split()
-                    if parts:
-                        current_job["job_status_code"] = parts[0]
-                jobs.append(current_job)
+            # Filter out empty cells from spacer images
+            cells = [c for c in cells if c and not c.startswith('\n')]
 
-        elif current_job and not job_match:
-            text = re.sub(r'<[^>]+>', '', row).strip()
-            if text and len(text) > 10 and not text.startswith('FILE DATE'):
+            # BIS columns: FILE DATE, JOB#, DOC#, JOB TYPE, JOB STATUS, STATUS DATE, LIC#, [LIC TYPE], APPLICANT, IN AUDIT, ZONING
+            job_num = job_match.group(1)
+            filing_date = date_match.group(1)
+
+            # Find doc number — typically 2 digits after the job number
+            doc_num = "01"
+            for c in cells:
+                if re.match(r'^\d{1,2}$', c) and c != job_num[:2]:
+                    doc_num = c.zfill(2)
+                    break
+
+            # Find job type (A1, A2, A3, NB, DM, etc.)
+            job_type = None
+            for c in cells:
+                if re.match(r'^[A-Z][A-Z0-9]?[0-9]?$', c) and len(c) <= 3:
+                    job_type = c
+                    break
+
+            # Find job status — contains multi-word status like "X SIGNED OFF"
+            job_status = None
+            job_status_code = None
+            for c in cells:
+                if any(s in c.upper() for s in ['SIGNED OFF', 'APPROVED', 'IN PROCESS', 'PERMIT ISSUED', 'WITHDRAWN']):
+                    job_status = c
+                    parts = c.split()
+                    if parts:
+                        job_status_code = parts[0]
+                    break
+
+            # Find status date (second date in the row)
+            dates = re.findall(r'(\d{2}/\d{2}/\d{4})', row)
+            status_date = dates[1] if len(dates) > 1 else None
+
+            # Find license number and type
+            lic_match = re.search(r'(\d{7})\s*(PE|RA)', ' '.join(cells))
+            license_number = lic_match.group(1) if lic_match else None
+            license_type = lic_match.group(2) if lic_match else None
+
+            # Find applicant — last significant text cell
+            applicant = None
+            for c in reversed(cells):
+                if (c and len(c) > 2 and not re.match(r'^\d', c) and
+                    c.upper() not in ['NOT APPLICABLE', 'GRANTED', 'Y', 'N', '']):
+                    applicant = c
+                    break
+
+            # Zoning approval
+            zoning = None
+            for c in cells:
+                if 'GRANTED' in c.upper() or 'NOT APPLICABLE' in c.upper():
+                    zoning = c
+                    break
+
+            current_job = {
+                "filing_date": filing_date,
+                "job_number": job_num,
+                "doc_number": doc_num,
+                "job_type": job_type,
+                "job_status": job_status,
+                "job_status_code": job_status_code,
+                "status_date": status_date,
+                "license_number": license_number,
+                "license_type": license_type,
+                "applicant": applicant,
+                "zoning_approval": zoning,
+                "description": None,
+                "floors": None,
+                "withdrawn": False,
+                "source": "BIS_SCRAPE",
+            }
+            jobs.append(current_job)
+
+        elif current_job:
+            # Check if this is a description row
+            text = re.sub(r'<[^>]+>', ' ', row).strip()
+            text = re.sub(r'\s+', ' ', text).strip()
+
+            if text and len(text) > 10 and 'FILE DATE' not in text and 'JOB #' not in text:
                 current_job["description"] = text
+
+                # Extract floor info
+                floor_match = re.search(r'Work on Floor\(s\):\s*(.*?)(?:\s*$)', text, re.IGNORECASE)
+                if floor_match:
+                    current_job["floors"] = floor_match.group(1).strip()
+
+                # Check for withdrawn
                 if "WITHDRAWN" in text.upper():
                     current_job["withdrawn"] = True
+                    # Also update status if not already set
+                    if current_job["job_status"] and "WITHDRAWN" not in current_job["job_status"].upper():
+                        current_job["job_status"] = current_job["job_status"] + " (WITHDRAWN)"
+
                 current_job = None
 
     log(f"Parsed {len(jobs)} jobs from HTML")
