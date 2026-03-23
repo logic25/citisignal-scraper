@@ -88,7 +88,7 @@ def scrape_bis():
             result = scrape_profile(page, bin_number, boro, block, lot, debug)
         elif action == "jobs":
             result = scrape_jobs_by_location(page, bin_number, debug, boro, block, lot)
-        elif action == "job_detail":
+        elif action in ("job_detail", "job"):
             result = scrape_job_detail(page, job_number, debug)
         else:
             result = {"error": f"Unknown action: {action}"}
@@ -103,33 +103,33 @@ def scrape_bis():
 
 
 def navigate_bis_search(page, bin_number=None, boro=None, block=None, lot=None):
-    """Navigate to BIS by visiting homepage first (for cookies), then direct URL.
+    """Navigate to BIS Property Profile via the search form.
 
-    BIS search form fields are unreliable from Playwright. Instead:
-    1. Visit BIS homepage to get session cookies
-    2. Navigate directly to the target page URL
+    Direct URLs to PropertyProfileOverviewServlet get redirected
+    to the homepage. We must go through the search form.
     """
-    # Step 1: Visit BIS homepage to establish session/cookies
-    log("Visiting BIS homepage for session cookies...")
-    page.goto("https://a810-bisweb.nyc.gov/bisweb/bispi00.jsp",
-              timeout=15000, wait_until="domcontentloaded")
+    search_url = "https://a810-bisweb.nyc.gov/bisweb/bsqpm01.jsp"
+    log(f"Navigating to BIS search page...")
+    page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
     time.sleep(1)
 
-    # Step 2: Navigate directly to Property Profile
     if bin_number:
-        url = (f"https://a810-bisweb.nyc.gov/bisweb/PropertyProfileOverviewServlet"
-               f"?allbin={bin_number}&requestid=0")
+        log(f"Searching by BIN {bin_number}")
+        page.fill('input[name="bin"]', str(bin_number), timeout=10000)
+        page.click('input[name="go4"]', timeout=5000)
+        time.sleep(2)
+        log(f"After BIN search, URL: {page.url}")
     elif block and lot:
         boro_val = boro or "1"
-        url = (f"https://a810-bisweb.nyc.gov/bisweb/PropertyProfileOverviewServlet"
-               f"?boro={boro_val}&block={block}&lot={lot}&requestid=0")
+        log(f"Searching by BBL: boro={boro_val} block={block} lot={lot}")
+        page.select_option('select[name="allborough"]', boro_val)
+        page.fill('input[name="allblock"]', str(block))
+        page.fill('input[name="alllot"]', str(lot))
+        page.click('input[name="go5"]', timeout=5000)
+        time.sleep(2)
+        log(f"After BBL search, URL: {page.url}")
     else:
         raise ValueError("Need bin or block+lot to search BIS")
-
-    log(f"Navigating to: {url}")
-    page.goto(url, timeout=15000, wait_until="domcontentloaded")
-    time.sleep(2)
-    log(f"Arrived at: {page.url}")
 
 
 def scrape_profile(page, bin_number, boro, block, lot, debug=False):
