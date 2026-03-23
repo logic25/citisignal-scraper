@@ -89,7 +89,7 @@ def scrape_bis():
         elif action == "jobs":
             result = scrape_jobs_by_location(page, bin_number, debug, boro, block, lot)
         elif action in ("job_detail", "job"):
-            result = scrape_job_detail(page, job_number, debug)
+            result = scrape_job_detail(page, job_number, bin_number, debug)
         else:
             result = {"error": f"Unknown action: {action}"}
 
@@ -115,10 +115,17 @@ def navigate_bis_search(page, bin_number=None, boro=None, block=None, lot=None):
 
     if bin_number:
         log(f"Searching by BIN {bin_number}")
-        page.fill('input[name="bin"]', str(bin_number), timeout=10000)
-        page.click('input[name="go4"]', timeout=5000)
-        time.sleep(2)
-        log(f"After BIN search, URL: {page.url}")
+        try:
+            page.fill('input[name="bin"]', str(bin_number), timeout=10000)
+            page.click('input[name="go4"]', timeout=5000)
+            time.sleep(2)
+            log(f"After BIN search, URL: {page.url}")
+        except Exception as e:
+            log(f"BIN search form failed ({e}), trying direct URL with cookies...")
+            url = f"https://a810-bisweb.nyc.gov/bisweb/PropertyProfileOverviewServlet?allbin={bin_number}&requestid=0"
+            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            time.sleep(2)
+            log(f"After direct URL, URL: {page.url}")
     elif block and lot:
         boro_val = boro or "1"
         log(f"Searching by BBL: boro={boro_val} block={block} lot={lot}")
@@ -268,20 +275,44 @@ def scrape_jobs_by_location(page, bin_number, debug=False, boro=None, block=None
     }
 
 
-def scrape_job_detail(page, job_number, debug=False):
-    """Scrape BIS job detail page for all doc numbers.
+def scrape_job_detail(page, job_number, bin_number=None, debug=False):
+    """Get all docs for a specific job number.
 
-    BIS doesn't have a direct job search from the main page.
-    We use the JobsQueryByNumberServlet URL but navigate through
-    the search form first to establish a session cookie.
+    JobsQueryByNumberServlet is blocked by Akamai, so we can't
+    scrape the job detail page directly. Instead, if we have a BIN,
+    we scrape all jobs for the property and filter to just this job.
+
+    If no BIN is provided, we try the direct URL as a fallback.
     """
-    # First visit search page to get session cookies
+    if bin_number:
+        # Use the working jobs-by-location approach and filter
+        log(f"Job detail: using jobs-by-location for BIN {bin_number}, filtering to {job_number}")
+        result = scrape_jobs_by_location(page, bin_number, debug)
+        if debug:
+            return result
+        if result.get("error"):
+            return {"error": result["error"], "documents": [], "job_number": job_number}
+
+        # Filter to just this job number
+        all_jobs = result.get("jobs", [])
+        matching = [j for j in all_jobs if str(j.get("job_number", "")) == str(job_number)]
+
+        withdrawn = any(j.get("withdrawn") for j in matching)
+
+        return {
+            "job_number": job_number,
+            "documents": matching,
+            "doc_count": len(matching),
+            "withdrawn": withdrawn,
+            "scraped_at": datetime.utcnow().isoformat(),
+        }
+
+    # Fallback: try direct URL (may be blocked by Akamai)
     search_url = "https://a810-bisweb.nyc.gov/bisweb/bsqpm01.jsp"
     log(f"Job detail: visiting search page for session...")
     page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
     time.sleep(1)
 
-    # Now navigate to the job query URL with the session established
     job_url = (f"https://a810-bisweb.nyc.gov/bisweb/JobsQueryByNumberServlet"
                f"?passjobnumber={job_number}&passjoession=0&requestid=0")
     log(f"Job detail: navigating to {job_url}")
@@ -295,27 +326,18 @@ def scrape_job_detail(page, job_number, debug=False):
     html = page.content()
 
     if "Access Denied" in html:
-        return {"error": "Access denied by Akamai", "blocked": True}
+        return {"error": "Access denied by Akamai — provide bin parameter for reliable results", "blocked": True}
 
     if debug:
         return {"html": html[:50000], "html_length": len(html)}
 
     jobs = parse_bis_jobs_table(html)
-
-    # Try to extract estimated cost and other details from the page
-    estimated_cost = None
-    m = re.search(r'(?:Estimated\s*(?:Job\s*)?Cost|Initial\s*Cost)[^$]*\$\s*([\d,]+)', html, re.IGNORECASE)
-    if m:
-        estimated_cost = m.group(1).replace(',', '')
-
-    # Check for withdrawn in page text
     withdrawn = "WITHDRAWN" in html.upper()
 
     return {
         "job_number": job_number,
         "documents": jobs,
         "doc_count": len(jobs),
-        "estimated_cost": estimated_cost,
         "withdrawn": withdrawn,
         "scraped_at": datetime.utcnow().isoformat(),
     }
