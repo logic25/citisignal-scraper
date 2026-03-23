@@ -111,19 +111,34 @@ def navigate_bis_search(page, bin_number=None, boro=None, block=None, lot=None):
 
     if bin_number:
         log(f"Searching by BIN {bin_number}")
-        page.fill('input[name="allbin"]', str(bin_number))
+        # BIS has two BIN fields: "bin" (Property Profile section) and "allbin" (another section)
+        # Try "bin" first (with go4 submit), fallback to "allbin" (with go8 submit)
+        try:
+            page.fill('input[name="bin"]', str(bin_number), timeout=3000)
+            page.click('input[name="go4"]', timeout=3000)
+            time.sleep(2)
+            log(f"Searched via bin field, URL: {page.url}")
+            return  # Successfully navigated
+        except Exception:
+            log("bin field failed, trying allbin...")
+            page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
+            time.sleep(1)
+            page.fill('input[name="allbin"]', str(bin_number), timeout=3000)
+            page.click('input[name="go8"]', timeout=3000)
+            time.sleep(2)
+            log(f"Searched via allbin field, URL: {page.url}")
+            return
     elif block and lot:
         boro_val = boro or "1"
         log(f"Searching by boro={boro_val} block={block} lot={lot}")
         page.select_option('select[name="allborough"]', boro_val)
         page.fill('input[name="allblock"]', str(block))
         page.fill('input[name="alllot"]', str(lot))
+        page.click('input[name="go5"]', timeout=3000)
+        time.sleep(2)
+        log(f"Searched via block/lot, URL: {page.url}")
     else:
         raise ValueError("Need bin or block+lot to search BIS")
-
-    page.click('input[type="submit"][value="GO"]')
-    time.sleep(2)
-    log(f"After search, URL: {page.url}")
 
 
 def scrape_profile(page, bin_number, boro, block, lot, debug=False):
