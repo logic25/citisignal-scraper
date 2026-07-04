@@ -13,7 +13,6 @@ import sys
 import time
 from datetime import datetime
 from flask import Flask, request, jsonify
-from playwright_stealth import stealth_sync
 
 app = Flask(__name__)
 
@@ -92,7 +91,6 @@ def scrape_bis():
             locale="en-US",
             timezone_id="America/New_York",
         )
-        stealth_sync(page)
 
         result = {}
 
