@@ -19,6 +19,27 @@ app = Flask(__name__)
 PORT = int(os.environ.get("PORT", 8080))
 SCRAPER_SECRET = os.environ.get("SCRAPER_SECRET", "")
 
+# Optional egress proxy for when BIS's WAF blocks the datacenter IP.
+# Strategy is direct-first: the proxy is only used to retry a request that
+# came back blocked, so proxy bandwidth is spent only when actually needed.
+#   PROXY_SERVER   e.g. "http://proxy-host:8000" (residential/rotating)
+#   PROXY_USERNAME / PROXY_PASSWORD  optional credentials
+PROXY_SERVER = os.environ.get("PROXY_SERVER", "")
+PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
+
+
+def proxy_config():
+    """Playwright proxy dict, or None when no proxy is configured."""
+    if not PROXY_SERVER:
+        return None
+    cfg = {"server": PROXY_SERVER}
+    if PROXY_USERNAME:
+        cfg["username"] = PROXY_USERNAME
+    if PROXY_PASSWORD:
+        cfg["password"] = PROXY_PASSWORD
+    return cfg
+
 
 def log(msg):
     print(f"[BIS-SCRAPER] {datetime.utcnow().isoformat()} {msg}", flush=True)
@@ -68,6 +89,7 @@ def health():
         "status": "ok",
         "service": "citisignal-bis-scraper",
         "secret_configured": bool(SCRAPER_SECRET),
+        "proxy_configured": bool(PROXY_SERVER),
     })
 
 
@@ -104,37 +126,53 @@ def scrape_bis():
 
         log(f"Scrape: action={action}, bin={bin_number}, job={job_number}")
 
+        def run_attempt(pw, proxy=None):
+            """Launch a browser (optionally through the proxy) and run the action."""
+            launch_kwargs = {
+                "headless": True,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--no-sandbox",
+                ],
+            }
+            if proxy:
+                launch_kwargs["proxy"] = proxy
+            browser = pw.chromium.launch(**launch_kwargs)
+            try:
+                page = browser.new_page(
+                    user_agent="Mozilla/5.0 (X11; Linux x86_64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/131.0.0.0 Safari/537.36",
+                    viewport={"width": 1920, "height": 1080},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                )
+                if action == "profile":
+                    return scrape_profile(page, bin_number, boro, block, lot, debug)
+                elif action == "jobs":
+                    return scrape_jobs_by_location(page, bin_number, debug, boro, block, lot)
+                elif action in ("job_detail", "job"):
+                    return scrape_job_detail(page, job_number, bin_number, debug)
+                return {"error": f"Unknown action: {action}"}
+            finally:
+                browser.close()
+
         pw = sync_playwright().start()
-        browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--no-sandbox",
-            ],
-        )
-        page = browser.new_page(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/131.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
+        try:
+            # Attempt 1: direct connection (free, usually works).
+            result = run_attempt(pw)
 
-        result = {}
+            # Attempt 2: if blocked and a proxy is configured, retry through it.
+            if result.get("blocked") and proxy_config():
+                log("Blocked on direct connection — retrying via proxy...")
+                result = run_attempt(pw, proxy=proxy_config())
+                result["via_proxy"] = True
+                if result.get("blocked"):
+                    log("Still blocked via proxy.")
+        finally:
+            pw.stop()
 
-        if action == "profile":
-            result = scrape_profile(page, bin_number, boro, block, lot, debug)
-        elif action == "jobs":
-            result = scrape_jobs_by_location(page, bin_number, debug, boro, block, lot)
-        elif action in ("job_detail", "job"):
-            result = scrape_job_detail(page, job_number, bin_number, debug)
-        else:
-            result = {"error": f"Unknown action: {action}"}
-
-        browser.close()
-        pw.stop()
         # Blocked/unexpected pages return 503 so callers' non-2xx failure
         # paths engage (CitiSignal increments scrape_fail_count) instead of
         # recording an empty scrape as a success.
