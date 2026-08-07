@@ -32,6 +32,36 @@ def verify_auth(req):
     return secret == SCRAPER_SECRET
 
 
+# Signatures of WAF/bot-protection pages that BIS serves with HTTP 200.
+# Without these checks a block looks identical to "building has no jobs".
+BLOCK_SIGNATURES = [
+    "Access Denied",             # Akamai hard denial
+    "errors.edgesuite.net",      # Akamai error page
+    "Pardon Our Interruption",   # Imperva/Distil challenge
+    "Request unsuccessful",      # Incapsula
+    "/_Incapsula_Resource",      # Incapsula challenge script
+    "captcha",                   # generic challenge
+]
+
+
+def detect_block(html, page_url, expected_markers):
+    """Return a reason string if the fetched page is a block/challenge page or
+    not the BIS page we expected; None when the page is genuine.
+
+    expected_markers: list of strings, ANY of which proves we reached the
+    right BIS page (headers survive even when a building has zero records).
+    """
+    lowered = html.lower()
+    for sig in BLOCK_SIGNATURES:
+        if sig.lower() in lowered:
+            return f"blocked ({sig})"
+    if expected_markers and not any(m.lower() in lowered for m in expected_markers):
+        # 200 OK but wrong page: bounced to homepage/search — a soft block
+        # or lost session. Must NOT be treated as an empty result.
+        return f"unexpected page (none of {expected_markers} found, url={page_url})"
+    return None
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
@@ -105,7 +135,11 @@ def scrape_bis():
 
         browser.close()
         pw.stop()
-        return jsonify(result)
+        # Blocked/unexpected pages return 503 so callers' non-2xx failure
+        # paths engage (CitiSignal increments scrape_fail_count) instead of
+        # recording an empty scrape as a success.
+        status = 503 if result.get("blocked") else 200
+        return jsonify(result), status
 
     except Exception as e:
         log(f"Scrape ERROR: {e}")
@@ -161,15 +195,13 @@ def scrape_profile(page, bin_number, boro, block, lot, debug=False):
 
     html = page.content()
 
-    if "Access Denied" in html:
-        return {"error": "Access denied by Akamai", "blocked": True}
+    block_reason = detect_block(html, page.url, ["Property Profile"])
+    if block_reason:
+        log(f"Profile BLOCKED: {block_reason}")
+        return {"error": block_reason, "blocked": True, "page_url": page.url}
 
     if debug:
         return {"html": html[:50000], "html_length": len(html)}
-
-    # Verify we got the property profile page
-    if "Property Profile" not in html:
-        return {"error": "Did not reach Property Profile page", "page_url": page.url}
 
     # Vacate order
     vacate_order = False
@@ -270,8 +302,15 @@ def scrape_jobs_by_location(page, bin_number, debug=False, boro=None, block=None
 
     html = page.content()
 
-    if "Access Denied" in html:
-        return {"error": "Access denied by Akamai", "blocked": True}
+    # Jobs page markers survive even for buildings with zero filings, so a
+    # marker miss means we never reached the jobs page — not an empty result.
+    block_reason = detect_block(
+        html, page.url,
+        ["FILE DATE", "Jobs/Filings", "NO JOBS", "NO RECORDS"],
+    )
+    if block_reason:
+        log(f"Jobs BLOCKED: {block_reason}")
+        return {"error": block_reason, "blocked": True, "page_url": page.url, "jobs": []}
 
     if debug:
         return {"html": html[:50000], "html_length": len(html)}
@@ -281,6 +320,7 @@ def scrape_jobs_by_location(page, bin_number, debug=False, boro=None, block=None
         "bin": bin_number,
         "jobs": jobs,
         "job_count": len(jobs),
+        "page_verified": True,  # zero jobs is now a trustworthy zero
         "scraped_at": datetime.utcnow().isoformat(),
     }
 
@@ -335,8 +375,15 @@ def scrape_job_detail(page, job_number, bin_number=None, debug=False):
 
     html = page.content()
 
-    if "Access Denied" in html:
-        return {"error": "Access denied by Akamai — provide bin parameter for reliable results", "blocked": True}
+    block_reason = detect_block(
+        html, page.url,
+        ["FILE DATE", "Jobs/Filings", "NO JOBS", "NO RECORDS"],
+    )
+    if block_reason:
+        return {
+            "error": f"{block_reason} — provide bin parameter for reliable results",
+            "blocked": True, "page_url": page.url, "documents": [],
+        }
 
     if debug:
         return {"html": html[:50000], "html_length": len(html)}
