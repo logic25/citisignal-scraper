@@ -1,9 +1,17 @@
 """BIS Web Scraper for CitiSignal.
 
-Standalone Playwright service that scrapes BIS property profiles
-and job filings. CitiSignal's edge functions call this API.
+Standalone Playwright service that fetches BIS property profiles,
+job filings, DOF PTAPS property tax data, and DEP CIS water/sewer
+account data. CitiSignal and BinCheck call this shared API.
 
 Separate from dob-agent (Ordino) — each product has its own scraper.
+
+Actions:
+  profile    — BIS Property Profile (vacate orders, restrictions, counts)
+  jobs       — BIS Jobs/Filings by location (all docs including PAAs)
+  job_detail — Single job detail (all doc numbers for one job)
+  dof_ptaps  — DOF Property Tax And Public Service bill lookup (input: bbl)
+  dep_cis    — DEP Customer Information System water/sewer account (input: bbl or address)
 """
 
 import json
@@ -114,12 +122,19 @@ def scrape_bis():
     job_number = body.get("job_number")
     debug = body.get("debug", False)
 
+    bbl = body.get("bbl")
+    address = body.get("address")
+
     if action == "profile" and not bin_number:
         return jsonify({"error": "bin is required for profile action"}), 400
     if action == "jobs" and not bin_number:
         return jsonify({"error": "bin is required for jobs action"}), 400
     if action == "job_detail" and not job_number:
         return jsonify({"error": "job_number is required for job_detail action"}), 400
+    if action == "dof_ptaps" and not bbl:
+        return jsonify({"error": "bbl is required for dof_ptaps action"}), 400
+    if action == "dep_cis" and not bbl and not address:
+        return jsonify({"error": "bbl or address is required for dep_cis action"}), 400
 
     try:
         from playwright.sync_api import sync_playwright
@@ -154,6 +169,10 @@ def scrape_bis():
                     return scrape_jobs_by_location(page, bin_number, debug, boro, block, lot)
                 elif action in ("job_detail", "job"):
                     return scrape_job_detail(page, job_number, bin_number, debug)
+                elif action == "dof_ptaps":
+                    return fetch_dof_ptaps(page, bbl, debug)
+                elif action == "dep_cis":
+                    return fetch_dep_cis(page, bbl, address, debug)
                 return {"error": f"Unknown action: {action}"}
             finally:
                 browser.close()
@@ -435,6 +454,664 @@ def scrape_job_detail(page, job_number, bin_number=None, debug=False):
         "doc_count": len(jobs),
         "withdrawn": withdrawn,
         "scraped_at": datetime.utcnow().isoformat(),
+    }
+
+
+# ============================================================================
+# DOF PTAPS — Property Tax And Public Service bill lookup
+# ============================================================================
+
+def parse_bbl(bbl: str):
+    """Split a 10-digit BBL into (boro, block_padded, lot_padded) strings.
+
+    PTAPS expects:
+      - boro: single digit (1-5)
+      - block: 1-5 digits (no leading zeros required by the form)
+      - lot:   1-4 digits
+    """
+    bbl = re.sub(r'[^0-9]', '', bbl)
+    if len(bbl) < 10:
+        raise ValueError(f"BBL must be 10 digits, got {len(bbl)}: {bbl!r}")
+    boro  = bbl[0]
+    block = bbl[1:6].lstrip('0') or '0'
+    lot   = bbl[6:10].lstrip('0') or '0'
+    return boro, block, lot
+
+
+def fetch_dof_ptaps(page, bbl: str, debug: bool = False) -> dict:
+    """Fetch DOF PTAPS property tax bill data for a BBL.
+
+    DOF's Property Tax And Public Service portal (a836-pts-access.nyc.gov)
+    is a classic ASP.NET WebForms app. We navigate the common-property-search
+    form, submit by BBL, then read the resulting account summary page.
+
+    Returned shape mirrors the existing Socrata fetchDOFCharges output so
+    generate-dd-report/index.ts can swap in either source without changes to
+    downstream rendering:
+
+      {
+        bbl, source, fetched_at,
+        account: { account_number, owner_name, mailing_address },
+        current_charges: { annual_tax, quarterly_amount, due_date, period },
+        arrears: { balance_due, interest, total_due },
+        exemptions: [ { program, amount } ],
+        totals: { outstanding, interest, count },
+        by_type: { TAX: { label, count, balance, oldest_due } },
+        items: [ { code, code_label, balance, interest, due_date, ... } ],
+        raw_sections: { ... }   # debug only
+      }
+    """
+    try:
+        boro, block, lot = parse_bbl(bbl)
+    except ValueError as e:
+        return {"error": str(e), "bbl": bbl}
+
+    log(f"DOF PTAPS: BBL={bbl} → boro={boro} block={block} lot={lot}")
+
+    # ── Step 1: land on the portal home and get a session cookie ──────────────
+    portal_home = "https://a836-pts-access.nyc.gov/care/forms/htmlframe.aspx?mode=content/home.htm"
+    log("DOF PTAPS: loading portal home for session...")
+    try:
+        page.goto(portal_home, timeout=20000, wait_until="domcontentloaded")
+        time.sleep(1)
+    except Exception as e:
+        log(f"DOF PTAPS: portal home failed: {e}")
+        return {"error": f"Portal home unreachable: {e}", "bbl": bbl}
+
+    # ── Step 2: navigate to the BBL search form ───────────────────────────────
+    search_url = "https://a836-pts-access.nyc.gov/care/search/commonsearch.aspx?mode=persprop"
+    log(f"DOF PTAPS: navigating to search form...")
+    try:
+        page.goto(search_url, timeout=20000, wait_until="domcontentloaded")
+        time.sleep(1)
+    except Exception as e:
+        log(f"DOF PTAPS: search form load failed: {e}")
+        return {"error": f"Search form unreachable: {e}", "bbl": bbl}
+
+    html = page.content()
+    if debug:
+        return {"html": html[:50000], "html_length": len(html), "step": "search_form"}
+
+    # ── Step 3: fill and submit BBL fields ────────────────────────────────────
+    # The form has three fields: borough (select), block (text), lot (text).
+    # Field names vary by portal version — try both common naming conventions.
+    try:
+        # Try to select the Borough dropdown
+        for sel in ['select[name*="Borough"]', 'select[name*="boro"]',
+                    '#inpParid_boro', 'select#parcel_boro']:
+            try:
+                page.select_option(sel, boro, timeout=3000)
+                log(f"DOF PTAPS: selected boro={boro} via {sel}")
+                break
+            except Exception:
+                continue
+
+        for sel in ['input[name*="Block"]', 'input[name*="block"]',
+                    '#inpParid_block', 'input#parcel_block']:
+            try:
+                page.fill(sel, block, timeout=3000)
+                log(f"DOF PTAPS: filled block={block} via {sel}")
+                break
+            except Exception:
+                continue
+
+        for sel in ['input[name*="Lot"]', 'input[name*="lot"]',
+                    '#inpParid_lot', 'input#parcel_lot']:
+            try:
+                page.fill(sel, lot, timeout=3000)
+                log(f"DOF PTAPS: filled lot={lot} via {sel}")
+                break
+            except Exception:
+                continue
+
+        # Submit
+        for sel in ['input[type="submit"]', 'button[type="submit"]',
+                    'input[value*="Search"]', 'input[name*="Submit"]']:
+            try:
+                page.click(sel, timeout=5000)
+                log(f"DOF PTAPS: submitted via {sel}")
+                time.sleep(3)
+                break
+            except Exception:
+                continue
+
+    except Exception as e:
+        log(f"DOF PTAPS: form interaction error: {e}")
+        return {"error": f"Form interaction failed: {e}", "bbl": bbl}
+
+    # ── Step 4: parse the account summary ────────────────────────────────────
+    html = page.content()
+    current_url = page.url
+    log(f"DOF PTAPS: post-submit URL={current_url}, html_len={len(html)}")
+
+    if debug:
+        return {"html": html[:60000], "html_length": len(html), "url": current_url}
+
+    # Check for "no records found" or error pages
+    if re.search(r'no records found|no match|not found|error occurred', html, re.IGNORECASE):
+        return {
+            "bbl": bbl, "source": "ptaps_live",
+            "fetched_at": datetime.utcnow().isoformat(),
+            "error": "No records found for this BBL in PTAPS",
+            "totals": {"outstanding": 0, "interest": 0, "count": 0},
+            "by_type": {}, "items": [],
+        }
+
+    return _parse_ptaps_html(html, bbl, current_url)
+
+
+def _parse_ptaps_html(html: str, bbl: str, page_url: str = "") -> dict:
+    """Parse the DOF PTAPS account summary HTML into a structured dict.
+
+    The PTAPS portal renders a property account page with sections for:
+      - Owner / mailing address
+      - Current quarterly charges and annual tax
+      - Outstanding balance / arrears
+      - Tax exemptions
+
+    We parse with regex since the page is served from a legacy ASP.NET app
+    (no React, no JSON API) and the DOM structure is stable across BBLs.
+    """
+    def strip_tags(s: str) -> str:
+        return re.sub(r'<[^>]+>', '', s).replace('&nbsp;', ' ').strip()
+
+    def parse_dollar(s: str) -> float:
+        if not s:
+            return 0.0
+        cleaned = re.sub(r'[^0-9.\-]', '', s.replace(',', ''))
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
+
+    # Owner / account info
+    owner_name = None
+    m = re.search(r'(?:Owner|Property Owner)[:\s]+</[^>]+>\s*<[^>]+>([^<]+)', html, re.IGNORECASE)
+    if m:
+        owner_name = strip_tags(m.group(1))
+
+    account_number = None
+    m = re.search(r'Account\s*(?:Number|#|No\.?)[:\s]*([\w\-]+)', html, re.IGNORECASE)
+    if m:
+        account_number = m.group(1).strip()
+
+    # Annual tax / current quarterly bill
+    annual_tax = 0.0
+    m = re.search(r'Annual\s+(?:Property\s+)?Tax[:\s]*\$?([\d,\.]+)', html, re.IGNORECASE)
+    if m:
+        annual_tax = parse_dollar(m.group(1))
+
+    quarterly_amount = 0.0
+    m = re.search(r'Quarterly\s+(?:Tax\s+)?(?:Amount|Bill)[:\s]*\$?([\d,\.]+)', html, re.IGNORECASE)
+    if m:
+        quarterly_amount = parse_dollar(m.group(1))
+
+    due_date = None
+    m = re.search(r'Due\s+Date[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{4})', html, re.IGNORECASE)
+    if m:
+        due_date = m.group(1).strip()
+
+    period = None
+    m = re.search(r'(?:Tax\s+)?Period[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}[^<]{0,60})', html, re.IGNORECASE)
+    if m:
+        period = strip_tags(m.group(1))
+
+    # Arrears / balance due
+    balance_due = 0.0
+    m = re.search(r'(?:Balance|Total)\s+Due[:\s]*\$?([\d,\.]+)', html, re.IGNORECASE)
+    if m:
+        balance_due = parse_dollar(m.group(1))
+
+    interest = 0.0
+    m = re.search(r'Interest[:\s]*\$?([\d,\.]+)', html, re.IGNORECASE)
+    if m:
+        interest = parse_dollar(m.group(1))
+
+    # Exemptions — look for table rows with exemption program names
+    exemptions = []
+    for em in re.finditer(
+        r'<tr[^>]*>.*?(?:STAR|SCHE|SCRIE|DRIE|ENHANCED|BASIC|Veterans|Clergy|Disability)[^<]*</.*?\$?([\d,\.]+)',
+        html, re.IGNORECASE | re.DOTALL
+    ):
+        prog_text = strip_tags(em.group(0))
+        amount = parse_dollar(em.group(1))
+        if amount > 0:
+            exemptions.append({"program": prog_text[:120], "amount": amount})
+
+    # Normalize to the same shape as fetchDOFCharges Socrata output
+    outstanding_total = balance_due
+    items = []
+    by_type: dict = {}
+
+    # Annual tax line item (TAX code)
+    if annual_tax > 0:
+        items.append({
+            "code": "TAX",
+            "code_label": "Property Tax",
+            "account_id": account_number,
+            "balance": annual_tax,
+            "interest": interest,
+            "liability": annual_tax,
+            "collected": 0.0,
+            "due_date": due_date,
+            "tax_year": None,
+            "project_no": None,
+            "cycle": None,
+        })
+        by_type["TAX"] = {
+            "label": "Property Tax",
+            "count": 1,
+            "balance": annual_tax,
+            "oldest_due": due_date,
+        }
+
+    # Arrears line item if separate from annual tax
+    if balance_due > 0 and balance_due != annual_tax:
+        items.append({
+            "code": "ARR",
+            "code_label": "Tax Arrears",
+            "account_id": account_number,
+            "balance": balance_due,
+            "interest": interest,
+            "liability": balance_due + interest,
+            "collected": 0.0,
+            "due_date": due_date,
+            "tax_year": None,
+            "project_no": None,
+            "cycle": None,
+        })
+        by_type["ARR"] = {
+            "label": "Tax Arrears",
+            "count": 1,
+            "balance": balance_due,
+            "oldest_due": due_date,
+        }
+        outstanding_total = max(outstanding_total, balance_due)
+
+    log(f"DOF PTAPS: annual_tax={annual_tax}, balance_due={balance_due}, interest={interest}, exemptions={len(exemptions)}")
+
+    return {
+        "bbl": bbl,
+        "source": "ptaps_live",
+        "fetched_at": datetime.utcnow().isoformat(),
+        "page_url": page_url,
+        "account": {
+            "account_number": account_number,
+            "owner_name": owner_name,
+            "mailing_address": None,  # available on detail page, not summary
+        },
+        "current_charges": {
+            "annual_tax": annual_tax,
+            "quarterly_amount": quarterly_amount,
+            "due_date": due_date,
+            "period": period,
+        },
+        "arrears": {
+            "balance_due": balance_due,
+            "interest": interest,
+            "total_due": round(balance_due + interest, 2),
+        },
+        "exemptions": exemptions,
+        # ── Socrata-compatible fields (used by fetchDOFCharges shape in generate-dd-report) ──
+        "totals": {
+            "outstanding": round(outstanding_total, 2),
+            "interest": round(interest, 2),
+            "count": len(items),
+        },
+        "by_type": by_type,
+        "items": items,
+    }
+
+
+# ============================================================================
+# DEP CIS — Customer Information System water/sewer account lookup
+# ============================================================================
+
+def fetch_dep_cis(page, bbl: str = None, address: str = None, debug: bool = False) -> dict:
+    """Fetch DEP CIS water/sewer account data for a property.
+
+    DEP's NYCePay portal (https://a836-nycepay.nyc.gov/nycepay/) allows
+    property owners and agents to look up water/sewer account balances by
+    BBL or account number. The portal uses a React SPA over a REST-ish
+    backend, so we navigate to the search form, submit by BBL, and read
+    the account summary.
+
+    Returned shape mirrors the WAT/SEW entries in fetchDOFCharges so that
+    generate-dd-report/index.ts can substitute either source seamlessly:
+
+      {
+        bbl, address, source, fetched_at,
+        account: { account_number, service_address, owner_name,
+                   meter_number, meter_size, last_reading_date,
+                   next_reading_date, next_bill_date },
+        current_bill: { amount_due, due_date, billing_period },
+        arrears: { past_due_balance, interest, total_due },
+        consumption: { last_read, previous_read, consumption_hcf, read_type },
+        totals: { outstanding, interest, count },
+        by_type: { WAT: {...}, SEW: {...} },
+        items: [ { code, code_label, balance, interest, due_date, ... } ]
+      }
+    """
+    log(f"DEP CIS: bbl={bbl}, address={address}")
+
+    # ── Step 1: load NYCePay portal ───────────────────────────────────────────
+    portal_url = "https://a836-nycepay.nyc.gov/nycepay/"
+    log("DEP CIS: loading NYCePay portal...")
+    try:
+        page.goto(portal_url, timeout=20000, wait_until="networkidle")
+        time.sleep(2)
+    except Exception as e:
+        log(f"DEP CIS: portal load failed ({e}), trying alternate...")
+        try:
+            page.goto(portal_url, timeout=20000, wait_until="domcontentloaded")
+            time.sleep(2)
+        except Exception as e2:
+            return {"error": f"NYCePay portal unreachable: {e2}", "bbl": bbl, "address": address}
+
+    html = page.content()
+    if debug:
+        return {"html": html[:50000], "html_length": len(html), "url": page.url, "step": "portal"}
+
+    # ── Step 2: find and use the BBL/account search ────────────────────────────
+    # NYCePay has a search-by-BBL form. The field structure varies slightly
+    # by portal version; we try the known selectors in order of specificity.
+
+    bbl_submitted = False
+    if bbl:
+        try:
+            boro, block, lot = parse_bbl(bbl)
+
+            # Try selecting borough + block + lot (form-based entry)
+            for boro_sel in ['select[name*="boro"]', 'select[name*="Borough"]',
+                              '#borough', 'select.borough-select']:
+                try:
+                    page.select_option(boro_sel, boro, timeout=3000)
+                    log(f"DEP CIS: selected boro={boro}")
+                    break
+                except Exception:
+                    continue
+
+            for block_sel in ['input[name*="block"]', 'input[name*="Block"]',
+                               '#block', 'input.block-input']:
+                try:
+                    page.fill(block_sel, block, timeout=3000)
+                    log(f"DEP CIS: filled block={block}")
+                    break
+                except Exception:
+                    continue
+
+            for lot_sel in ['input[name*="lot"]', 'input[name*="Lot"]',
+                             '#lot', 'input.lot-input']:
+                try:
+                    page.fill(lot_sel, lot, timeout=3000)
+                    log(f"DEP CIS: filled lot={lot}")
+                    break
+                except Exception:
+                    continue
+
+            # Submit the search
+            for submit_sel in ['button[type="submit"]', 'input[type="submit"]',
+                                'button:has-text("Search")', 'button:has-text("Find")',
+                                'input[value*="Search"]']:
+                try:
+                    page.click(submit_sel, timeout=5000)
+                    log(f"DEP CIS: submitted via {submit_sel}")
+                    time.sleep(3)
+                    bbl_submitted = True
+                    break
+                except Exception:
+                    continue
+
+        except Exception as e:
+            log(f"DEP CIS: BBL form error: {e}")
+
+    # Fallback: try address search if BBL form didn't work
+    if not bbl_submitted and address:
+        log(f"DEP CIS: trying address search for {address!r}")
+        try:
+            for addr_sel in ['input[name*="address"]', 'input[name*="Address"]',
+                              '#address', 'input[placeholder*="address"]',
+                              'input[placeholder*="Address"]']:
+                try:
+                    page.fill(addr_sel, address, timeout=3000)
+                    page.press(addr_sel, 'Enter')
+                    time.sleep(3)
+                    bbl_submitted = True
+                    log(f"DEP CIS: address submitted via {addr_sel}")
+                    break
+                except Exception:
+                    continue
+        except Exception as e:
+            log(f"DEP CIS: address search error: {e}")
+
+    # ── Step 3: parse the account page ────────────────────────────────────────
+    html = page.content()
+    current_url = page.url
+    log(f"DEP CIS: post-submit URL={current_url}, html_len={len(html)}")
+
+    if debug:
+        return {"html": html[:60000], "html_length": len(html), "url": current_url}
+
+    if not bbl_submitted or re.search(
+        r'no account|not found|no results|error occurred', html, re.IGNORECASE
+    ):
+        # Return a structured empty shape so the caller can distinguish
+        # "lookup succeeded, no balance" from a hard error
+        return {
+            "bbl": bbl, "address": address,
+            "source": "cis_live",
+            "fetched_at": datetime.utcnow().isoformat(),
+            "error": "DEP CIS account not found or portal form could not be submitted",
+            "totals": {"outstanding": 0, "interest": 0, "count": 0},
+            "by_type": {}, "items": [],
+        }
+
+    return _parse_dep_cis_html(html, bbl, address, current_url)
+
+
+def _parse_dep_cis_html(html: str, bbl: str = None, address: str = None, page_url: str = "") -> dict:
+    """Parse the DEP NYCePay account summary HTML into a structured dict.
+
+    The account page surfaces:
+      - Account / meter info
+      - Current bill amount + due date
+      - Past-due balance
+      - Last / next meter read dates
+      - Consumption in HCF
+
+    Output is normalized to match the WAT/SEW shape in fetchDOFCharges so
+    generate-dd-report's existing charge-rendering logic accepts it without
+    modification.
+    """
+    def strip_tags(s: str) -> str:
+        return re.sub(r'<[^>]+>', '', s).replace('&nbsp;', ' ').strip()
+
+    def parse_dollar(s: str) -> float:
+        if not s:
+            return 0.0
+        cleaned = re.sub(r'[^0-9.\-]', '', s.replace(',', ''))
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
+
+    # Account metadata
+    account_number = None
+    m = re.search(r'Account\s*(?:Number|#|No\.?)[:\s]*([\w\-]+)', html, re.IGNORECASE)
+    if m:
+        account_number = m.group(1).strip()
+
+    owner_name = None
+    m = re.search(r'(?:Customer|Owner|Name)[:\s]*</[^>]+>\s*<[^>]+>([^<]+)', html, re.IGNORECASE)
+    if m:
+        owner_name = strip_tags(m.group(1))
+
+    service_address = None
+    m = re.search(r'(?:Service|Property)\s+Address[:\s]*</[^>]+>\s*<[^>]+>([^<]{5,100})', html, re.IGNORECASE)
+    if m:
+        service_address = strip_tags(m.group(1))
+
+    meter_number = None
+    m = re.search(r'Meter\s*(?:Number|#|No\.?)[:\s]*([\w\-]+)', html, re.IGNORECASE)
+    if m:
+        meter_number = m.group(1).strip()
+
+    meter_size = None
+    m = re.search(r'Meter\s+Size[:\s]*([\d\.]+"?)', html, re.IGNORECASE)
+    if m:
+        meter_size = m.group(1).strip()
+
+    # Bill / balance data
+    amount_due = 0.0
+    m = re.search(r'(?:Amount|Total)\s+Due[:\s]*\$?([\d,\.]+)', html, re.IGNORECASE)
+    if m:
+        amount_due = parse_dollar(m.group(1))
+
+    due_date = None
+    m = re.search(r'(?:Payment\s+)?Due\s+Date[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{4})', html, re.IGNORECASE)
+    if m:
+        due_date = m.group(1).strip()
+
+    billing_period = None
+    m = re.search(r'(?:Billing|Bill)\s+Period[:\s]*([A-Za-z0-9\s,/\-]{6,50})', html, re.IGNORECASE)
+    if m:
+        billing_period = strip_tags(m.group(1)).strip()
+
+    past_due = 0.0
+    m = re.search(r'Past\s+Due[:\s]*\$?([\d,\.]+)', html, re.IGNORECASE)
+    if m:
+        past_due = parse_dollar(m.group(1))
+
+    interest = 0.0
+    m = re.search(r'Interest[:\s]*\$?([\d,\.]+)', html, re.IGNORECASE)
+    if m:
+        interest = parse_dollar(m.group(1))
+
+    # Meter read info
+    last_reading_date = None
+    m = re.search(r'Last\s+Read(?:ing)?\s*Date?[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{4})', html, re.IGNORECASE)
+    if m:
+        last_reading_date = m.group(1).strip()
+
+    next_reading_date = None
+    m = re.search(r'Next\s+Read(?:ing)?\s*Date?[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{4})', html, re.IGNORECASE)
+    if m:
+        next_reading_date = m.group(1).strip()
+
+    next_bill_date = None
+    m = re.search(r'Next\s+Bill(?:ing)?\s*Date?[:\s]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{4})', html, re.IGNORECASE)
+    if m:
+        next_bill_date = m.group(1).strip()
+
+    last_read_val = None
+    m = re.search(r'(?:Last\s+)?(?:Present|Current)\s+Read(?:ing)?[:\s]*([\d]+)', html, re.IGNORECASE)
+    if m:
+        last_read_val = m.group(1).strip()
+
+    prev_read_val = None
+    m = re.search(r'Previous\s+Read(?:ing)?[:\s]*([\d]+)', html, re.IGNORECASE)
+    if m:
+        prev_read_val = m.group(1).strip()
+
+    consumption_hcf = None
+    m = re.search(r'(?:Consumption|Usage)[:\s]*([\d\.]+)\s*(?:HCF|Ccf|ccf)', html, re.IGNORECASE)
+    if m:
+        consumption_hcf = m.group(1).strip()
+
+    read_type = None
+    m = re.search(r'Read\s+Type[:\s]*([A-Za-z\s]+?)(?:<|\n|$)', html, re.IGNORECASE)
+    if m:
+        read_type = strip_tags(m.group(1)).strip()
+
+    # Normalize to Socrata-compatible shape (WAT + SEW split or combined)
+    items = []
+    by_type: dict = {}
+    total_outstanding = max(amount_due, past_due)
+
+    if amount_due > 0:
+        items.append({
+            "code": "WAT",
+            "code_label": "Water/Sewer Charge (DEP)",
+            "account_id": account_number,
+            "balance": amount_due,
+            "interest": interest,
+            "liability": amount_due,
+            "collected": 0.0,
+            "due_date": due_date,
+            "tax_year": None,
+            "project_no": None,
+            "cycle": billing_period,
+        })
+        by_type["WAT"] = {
+            "label": "Water/Sewer Charge (DEP)",
+            "count": 1,
+            "balance": amount_due,
+            "oldest_due": due_date,
+        }
+
+    if past_due > 0 and past_due != amount_due:
+        items.append({
+            "code": "WAT_ARR",
+            "code_label": "Water/Sewer Arrears (DEP)",
+            "account_id": account_number,
+            "balance": past_due,
+            "interest": interest,
+            "liability": past_due + interest,
+            "collected": 0.0,
+            "due_date": due_date,
+            "tax_year": None,
+            "project_no": None,
+            "cycle": billing_period,
+        })
+        by_type["WAT_ARR"] = {
+            "label": "Water/Sewer Arrears (DEP)",
+            "count": 1,
+            "balance": past_due,
+            "oldest_due": due_date,
+        }
+
+    log(f"DEP CIS: amount_due={amount_due}, past_due={past_due}, interest={interest}")
+
+    return {
+        "bbl": bbl,
+        "address": address,
+        "source": "cis_live",
+        "fetched_at": datetime.utcnow().isoformat(),
+        "page_url": page_url,
+        "account": {
+            "account_number": account_number,
+            "service_address": service_address,
+            "owner_name": owner_name,
+            "meter_number": meter_number,
+            "meter_size": meter_size,
+            "last_reading_date": last_reading_date,
+            "next_reading_date": next_reading_date,
+            "next_bill_date": next_bill_date,
+        },
+        "current_bill": {
+            "amount_due": amount_due,
+            "due_date": due_date,
+            "billing_period": billing_period,
+        },
+        "arrears": {
+            "past_due_balance": past_due,
+            "interest": interest,
+            "total_due": round(past_due + interest, 2),
+        },
+        "consumption": {
+            "last_read": last_read_val,
+            "previous_read": prev_read_val,
+            "consumption_hcf": consumption_hcf,
+            "read_type": read_type,
+        },
+        # ── Socrata-compatible fields (WAT/SEW shape from fetchDOFCharges) ──
+        "totals": {
+            "outstanding": round(total_outstanding, 2),
+            "interest": round(interest, 2),
+            "count": len(items),
+        },
+        "by_type": by_type,
+        "items": items,
     }
 
 
